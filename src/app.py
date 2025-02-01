@@ -4,128 +4,91 @@ from langchain_community.document_loaders import WebBaseLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain_community.llms import Ollama
-from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.chains import ConversationalRetrievalChain
+from langchain_community.chat_models import ChatOllama
 from langchain_community.embeddings import OllamaEmbeddings
 
+# Set page config
+st.set_page_config(page_title="Chat with Website", page_icon="🌐")
+st.title("Chat with Website 🌐")
 
-def get_vectorStrore_from_url(url):
-    # load the html text from the document and split it into chunks
-    #
-    # store the chunk in a vectore store
-    #
+# Initialize session state for chat history
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "vector_store" not in st.session_state:
+    st.session_state.vector_store = None
+
+# URL input
+url = st.text_input("Enter a website URL:")
+
+# Process the URL when submitted
+if url and st.session_state.vector_store is None:
+    # Load and process the website content
     loader = WebBaseLoader(url)
-    document = loader.load()
-
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=0) # To do: test performance
-    document_chunks = text_splitter.split_documents(document)
-
-    embeddings = OllamaEmbeddings(model='nomic-embed-text')
-    vectore_store = Chroma.from_documents(document_chunks, embeddings)
-
-    return vectore_store
-
-def get_context_retriever_chain(vector_store):
-    # set up the llm, retriver and prompt to the retriver_chain
-    #
-    # retriver_chain -> retrieve relevant information from the database
-    #
-    llm = Ollama(model='phi3') # "or any other model that you have"
-
-    retriver = vector_store.as_retriever(k=2) # To do: test `k`
-
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("user", "{input}"),
-            ("user", "Given the above conversation, generate a search query to look up in order to get the information relevant to the conversation")
-        ]
-    )
-
-    retriver_chain = create_history_aware_retriever(
-        llm, 
-        retriver, 
-        prompt
-    )
-
-    return retriver_chain
-
-def get_conversation_rag_chain(retriever_chain):
-    # summarize the contents of the context obtained from the webpage
-    #
-    # based on context generate the answer of the question
-    #
-    llm = Ollama(model='phi3') # "or any other model that you have"
-
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "Answer the user's questions based on the below context:\n\n{context}"
-            ),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("user", "{input}"),
-        ]
-    )
-
-    stuff_document_chain = create_stuff_documents_chain(llm,prompt)
-
-    return create_retrieval_chain(retriever_chain, stuff_document_chain)
-
-def get_response(user_input):
-    #  invokes the chains created to generate a response to a given user query
-    #
-    retriver_chain = get_context_retriever_chain(st.session_state.vector_store)
-    conversation_rag_chain = get_conversation_rag_chain(retriver_chain)
-
-    response = conversation_rag_chain.invoke({
-        "chat_history": st.session_state.chat_history,
-        "input": user_query
-    })
-
-    return response['answer']
-
-
-# streamlit app config
-#
-st.set_page_config(page_title="Lets chat with a Website", page_icon="💻")
-st.title("Lets chat with a Website")
-
-# sidebar setup
-with st.sidebar:
-    st.header("Setting")
-    website_url = st.text_input("Type the URL here")
-
-if website_url is None or website_url == "":
-    st.info("Please enter a website URL...")
-
-else:
-    # Session State
-    #
-    # Check the chat history for follow the conversation
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = [
-            AIMessage(content="Hello, I am a bot. How can I help you?"),
-        ]
-    # Check if there are already info stored in the vectorDB
-    if "vector_store" not in st.session_state:
-        st.session_state.vector_store = get_vectorStrore_from_url(website_url)
+    data = loader.load()
     
-    # user input
-    user_query = st.chat_input("Type here...")
-    if user_query is not None and user_query != "":
+    # Split the text into chunks
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    splits = text_splitter.split_documents(data)
+    
+    # Create and store the vector store
+    embeddings = OllamaEmbeddings(model="llama2")
+    st.session_state.vector_store = Chroma.from_documents(
+        documents=splits,
+        embedding=embeddings,
+    )
+    
+    st.success("Website content processed successfully!")
 
-        response = get_response(user_query)
-        
-        st.session_state.chat_history.append(HumanMessage(content=user_query))
-        st.session_state.chat_history.append(AIMessage(content=response))
-
-    # conversation history
+# Chat interface
+if st.session_state.vector_store:
+    # Initialize the chat model and chain
+    llm = ChatOllama(model="llama2", temperature=0.1)
+    
+    # Create the retrieval chain
+    retriever = st.session_state.vector_store.as_retriever()
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "Answer the question based on the following context:\n\n{context}"),
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "{question}")
+    ])
+    
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=retriever,
+        memory=None,
+        combine_docs_chain_kwargs={"prompt": prompt}
+    )
+    
+    # Display chat history
     for message in st.session_state.chat_history:
-        if isinstance(message, AIMessage):
-            with st.chat_message("AI"):
-                st.write(message.content)
-        elif isinstance(message, HumanMessage):
-            with st.chat_message("Human"):
-                st.write(message.content)
+        if isinstance(message, HumanMessage):
+            st.chat_message("user").write(message.content)
+        else:
+            st.chat_message("assistant").write(message.content)
+    
+    # Chat input
+    if user_input := st.chat_input("Ask about the website content"):
+        st.chat_message("user").write(user_input)
+        
+        # Add user message to chat history
+        st.session_state.chat_history.append(HumanMessage(content=user_input))
+        
+        # Get the response from the chain
+        response = chain.invoke({
+            "question": user_input,
+            "chat_history": [(m.type, m.content) for m in st.session_state.chat_history[:-1]]
+        })
+        
+        # Add AI response to chat history
+        ai_message = AIMessage(content=response["answer"])
+        st.session_state.chat_history.append(ai_message)
+        
+        # Display AI response
+        st.chat_message("assistant").write(ai_message.content)
+
+# Clear chat button
+if st.sidebar.button("Clear Chat"):
+    st.session_state.chat_history = []
+    st.session_state.vector_store = None
+    st.rerun()
