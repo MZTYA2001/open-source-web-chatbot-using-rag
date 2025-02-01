@@ -1,473 +1,128 @@
-import streamlit as st
-from langchain_core.messages import AIMessage, HumanMessage
-from langchain_community.document_loaders import WebBaseLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains import RetrievalQA
+from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
+from langchain.callbacks.manager import CallbackManager
+from langchain_community.llms import Ollama
+from langchain_community.embeddings.ollama import OllamaEmbeddings
 from langchain_community.vectorstores import Chroma
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain_community.embeddings import OllamaEmbeddings
-import json
-import aiohttp
-import requests
-from typing import Optional, Dict, Any, List, Union
-from dataclasses import dataclass
-from datetime import datetime
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import (
-    AIMessage,
-    BaseMessage,
-    ChatMessage,
-    HumanMessage,
-    SystemMessage,
-)
-from langchain_core.outputs import ChatResult, ChatGeneration, LLMResult
-from langchain_core.callbacks.manager import (
-    AsyncCallbackManagerForLLMRun,
-    CallbackManagerForLLMRun,
-)
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.prompts import PromptTemplate
+from langchain.memory import ConversationBufferMemory
+import streamlit as st
+import os
+import time
 
-@dataclass
-class ModelInfo:
-    """Information about an Ollama model."""
-    name: str
-    size: int
-    modified_at: datetime
-    digest: str
-    details: Dict[str, Any]
+if not os.path.exists('files'):
+    os.mkdir('files')
 
-class OllamaError(Exception):
-    """Base exception for Ollama API errors."""
-    pass
+if not os.path.exists('jj'):
+    os.mkdir('jj')
 
-class OllamaConnectionError(OllamaError):
-    """Raised when there's a connection error with Ollama API."""
-    pass
+if 'template' not in st.session_state:
+    st.session_state.template = """You are a knowledgeable chatbot, here to help with questions of the user. Your tone should be professional and informative.
 
-class OllamaAPIError(OllamaError):
-    """Raised when Ollama API returns an error."""
-    pass
+    Context: {context}
+    History: {history}
 
-class OllamaAPI:
-    """API client for Ollama."""
-    
-    def __init__(self, host: str = "http://localhost:11434"):
-        """Initialize Ollama API client.
-        
-        Args:
-            host: Base URL for Ollama API. Defaults to http://localhost:11434
-        """
-        self.host = host.rstrip('/')
-        self._session: Optional[aiohttp.ClientSession] = None
-    
-    async def _ensure_session(self) -> aiohttp.ClientSession:
-        """Ensure aiohttp session exists and create if needed."""
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=None)  # No timeout
-            )
-        return self._session
-    
-    async def close(self):
-        """Close the aiohttp session."""
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
-    
-    def _make_url(self, endpoint: str) -> str:
-        """Create full URL for API endpoint."""
-        return f"{self.host}/api/{endpoint}"
-    
-    async def generate(self, 
-                      prompt: str, 
-                      model: str = "llama2", 
-                      system: Optional[str] = None,
-                      template: Optional[str] = None,
-                      context: Optional[List[int]] = None,
-                      options: Optional[Dict[str, Any]] = None,
-                      stream: bool = False) -> Union[Dict[str, Any], AsyncGenerator[Dict[str, Any], None]]:
-        """Generate a response from the model."""
-        try:
-            payload = {
-                "model": model,
-                "prompt": prompt,
-                "stream": stream
-            }
-            
-            if system:
-                payload["system"] = system
-            if template:
-                payload["template"] = template
-            if context:
-                payload["context"] = context
-            if options:
-                payload["options"] = options
-                
-            session = await self._ensure_session()
-            
-            async with session.post(self._make_url("generate"), json=payload) as response:
-                response.raise_for_status()
-                
-                if stream:
-                    async def response_generator():
-                        async for line in response.content:
-                            if line:
-                                try:
-                                    yield json.loads(line)
-                                except json.JSONDecodeError as e:
-                                    raise OllamaAPIError(f"Failed to decode response: {e}")
-                    return response_generator()
-                else:
-                    return await response.json()
-                    
-        except aiohttp.ClientError as e:
-            raise OllamaConnectionError(f"Failed to connect to Ollama API: {e}")
-        except Exception as e:
-            raise OllamaAPIError(f"Ollama API error: {e}")
-    
-    async def chat(self,
-                  messages: List[Dict[str, str]],
-                  model: str = "llama2",
-                  stream: bool = False,
-                  options: Optional[Dict[str, Any]] = None) -> Union[Dict[str, Any], AsyncGenerator[Dict[str, Any], None]]:
-        """Chat with the model."""
-        try:
-            payload = {
-                "model": model,
-                "messages": messages,
-                "stream": stream
-            }
-            
-            if options:
-                payload["options"] = options
-                
-            session = await self._ensure_session()
-            
-            async with session.post(self._make_url("chat"), json=payload) as response:
-                response.raise_for_status()
-                
-                if stream:
-                    async def response_generator():
-                        async for line in response.content:
-                            if line:
-                                try:
-                                    yield json.loads(line)
-                                except json.JSONDecodeError as e:
-                                    raise OllamaAPIError(f"Failed to decode response: {e}")
-                    return response_generator()
-                else:
-                    return await response.json()
-                    
-        except aiohttp.ClientError as e:
-            raise OllamaConnectionError(f"Failed to connect to Ollama API: {e}")
-        except Exception as e:
-            raise OllamaAPIError(f"Ollama API error: {e}")
-    
-    def list_models(self) -> List[ModelInfo]:
-        """List all available models."""
-        try:
-            response = requests.get(self._make_url("tags"))
-            response.raise_for_status()
-            
-            models = []
-            for model in response.json().get("models", []):
-                models.append(ModelInfo(
-                    name=model["name"],
-                    size=model["size"],
-                    modified_at=datetime.fromisoformat(model["modified_at"].replace("Z", "+00:00")),
-                    digest=model["digest"],
-                    details=model.get("details", {})
-                ))
-            return models
-        except requests.RequestException as e:
-            raise OllamaConnectionError(f"Failed to list models: {e}")
-        except Exception as e:
-            raise OllamaAPIError(f"Failed to list models: {e}")
-    
-    def pull_model(self, name: str) -> None:
-        """Pull a model from the Ollama library."""
-        try:
-            response = requests.post(
-                self._make_url("pull"),
-                json={"name": name},
-                stream=True
-            )
-            response.raise_for_status()
-            
-            for line in response.iter_lines():
-                if line:
-                    status = json.loads(line)
-                    if "error" in status:
-                        raise OllamaAPIError(status["error"])
-        except requests.RequestException as e:
-            raise OllamaConnectionError(f"Failed to pull model: {e}")
-        except Exception as e:
-            raise OllamaAPIError(f"Failed to pull model: {e}")
-
-    def delete_model(self, name: str) -> None:
-        """Delete a model."""
-        try:
-            response = requests.delete(
-                self._make_url("delete"),
-                json={"name": name}
-            )
-            response.raise_for_status()
-        except requests.RequestException as e:
-            raise OllamaConnectionError(f"Failed to delete model: {e}")
-        except Exception as e:
-            raise OllamaAPIError(f"Failed to delete model: {e}")
-
-class ChatOllama(BaseChatModel):
-    """Chat model implementation for Ollama."""
-    
-    def __init__(
-        self,
-        model: str = "llama2",
-        base_url: str = "http://localhost:11434",
-        temperature: float = 0.7,
-        context_window: int = 4096,
-        max_tokens: Optional[int] = None,
-        **kwargs: Any,
-    ):
-        """Initialize ChatOllama."""
-        super().__init__(**kwargs)
-        self.model = model
-        self.client = OllamaAPI(base_url)
-        self.temperature = temperature
-        self.context_window = context_window
-        self.max_tokens = max_tokens
-        
-    @property
-    def _llm_type(self) -> str:
-        """Return type of LLM."""
-        return "ollama"
-
-    def _convert_messages_to_chat_params(
-        self, messages: List[BaseMessage]
-    ) -> List[Dict[str, str]]:
-        """Convert messages to chat parameters."""
-        return [
-            {
-                "role": self._convert_message_to_role(message),
-                "content": message.content,
-            }
-            for message in messages
-        ]
-
-    def _convert_message_to_role(self, message: BaseMessage) -> str:
-        """Convert a message to a role string."""
-        if isinstance(message, ChatMessage):
-            return message.role
-        elif isinstance(message, HumanMessage):
-            return "user"
-        elif isinstance(message, AIMessage):
-            return "assistant"
-        elif isinstance(message, SystemMessage):
-            return "system"
-        else:
-            raise ValueError(f"Got unknown message type: {message}")
-
-    async def _agenerate(
-        self,
-        messages: List[BaseMessage],
-        stop: Optional[List[str]] = None,
-        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
-        **kwargs: Any,
-    ) -> ChatResult:
-        """Generate chat response asynchronously."""
-        chat_params = self._convert_messages_to_chat_params(messages)
-        options = {
-            "temperature": self.temperature,
-            **kwargs
-        }
-        if self.max_tokens:
-            options["num_predict"] = self.max_tokens
-        if stop:
-            options["stop"] = stop
-            
-        try:
-            response = await self.client.chat(
-                messages=chat_params,
-                model=self.model,
-                options=options
-            )
-            
-            if run_manager:
-                await run_manager.on_llm_new_token(
-                    response["message"]["content"]
-                )
-            
-            message = AIMessage(content=response["message"]["content"])
-            return ChatResult(generations=[ChatGeneration(message=message)])
-        except Exception as e:
-            if run_manager:
-                await run_manager.on_llm_error(e)
-            raise
-
-    async def _astream(
-        self,
-        messages: List[BaseMessage],
-        stop: Optional[List[str]] = None,
-        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
-        **kwargs: Any,
-    ) -> AsyncGenerator[ChatResult, None]:
-        """Stream chat response asynchronously."""
-        chat_params = self._convert_messages_to_chat_params(messages)
-        options = {
-            "temperature": self.temperature,
-            **kwargs
-        }
-        if self.max_tokens:
-            options["num_predict"] = self.max_tokens
-        if stop:
-            options["stop"] = stop
-            
-        try:
-            async for chunk in await self.client.chat(
-                messages=chat_params,
-                model=self.model,
-                stream=True,
-                options=options
-            ):
-                if chunk.get("message", {}).get("content"):
-                    content = chunk["message"]["content"]
-                    if run_manager:
-                        await run_manager.on_llm_new_token(content)
-                    message = AIMessage(content=content)
-                    yield ChatResult(generations=[ChatGeneration(message=message)])
-        except Exception as e:
-            if run_manager:
-                await run_manager.on_llm_error(e)
-            raise
-
-    async def __aenter__(self):
-        """Async context manager entry."""
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit."""
-        await self.client.close()
-
-    def get_num_tokens(self, text: str) -> int:
-        """Get the number of tokens in a text."""
-        # This is a rough estimate, as Ollama doesn't provide a tokenizer
-        return len(text.split())
-
-def get_vectorStrore_from_url(url):
-    # load the html text from the document and split it into chunks
-    #
-    # store the chunk in a vectore store
-    #
-    loader = WebBaseLoader(url)
-    document = loader.load()
-
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=0) # To do: test performance
-    document_chunks = text_splitter.split_documents(document)
-
-    embeddings = OllamaEmbeddings(model='nomic-embed-text')
-    vectore_store = Chroma.from_documents(document_chunks, embeddings)
-
-    return vectore_store
-
-def get_context_retriever_chain(vector_store):
-    # set up the llm, retriver and prompt to the retriver_chain
-    #
-    # retriver_chain -> retrieve relevant information from the database
-    #
-    llm = ChatOllama(model='phi3') # "or any other model that you have"
-
-    retriver = vector_store.as_retriever(k=2) # To do: test `k`
-
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("user", "{input}"),
-            ("user", "Given the above conversation, generate a search query to look up in order to get the information relevant to the conversation")
-        ]
+    User: {question}
+    Chatbot:"""
+if 'prompt' not in st.session_state:
+    st.session_state.prompt = PromptTemplate(
+        input_variables=["history", "context", "question"],
+        template=st.session_state.template,
     )
+if 'memory' not in st.session_state:
+    st.session_state.memory = ConversationBufferMemory(
+        memory_key="history",
+        return_messages=True,
+        input_key="question")
+if 'vectorstore' not in st.session_state:
+    st.session_state.vectorstore = Chroma(persist_directory='jj',
+                                          embedding_function=OllamaEmbeddings(base_url='http://localhost:11434',
+                                                                              model="mistral")
+                                          )
+if 'llm' not in st.session_state:
+    st.session_state.llm = Ollama(base_url="http://localhost:11434",
+                                  model="mistral",
+                                  verbose=True,
+                                  callback_manager=CallbackManager(
+                                      [StreamingStdOutCallbackHandler()]),
+                                  )
 
-    retriver_chain = create_history_aware_retriever(
-        llm, 
-        retriver, 
-        prompt
-    )
+# Initialize session state
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
 
-    return retriver_chain
+st.title("PDF Chatbot")
 
-def get_conversation_rag_chain(retriever_chain):
-    # summarize the contents of the context obtained from the webpage
-    #
-    # based on context generate the answer of the question
-    #
-    llm = ChatOllama(model='phi3') # "or any other model that you have"
+# Upload a PDF file
+uploaded_file = st.file_uploader("Upload your PDF", type='pdf')
 
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "Answer the user's questions based on the below context:\n\n{context}"
-            ),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("user", "{input}"),
-        ]
-    )
+for message in st.session_state.chat_history:
+    with st.chat_message(message["role"]):
+        st.markdown(message["message"])
 
-    stuff_document_chain = create_stuff_documents_chain(llm,prompt)
+if uploaded_file is not None:
+    if not os.path.isfile("files/"+uploaded_file.name+".pdf"):
+        with st.status("Analyzing your document..."):
+            bytes_data = uploaded_file.read()
+            f = open("files/"+uploaded_file.name+".pdf", "wb")
+            f.write(bytes_data)
+            f.close()
+            loader = PyPDFLoader("files/"+uploaded_file.name+".pdf")
+            data = loader.load()
 
-    return create_retrieval_chain(retriever_chain, stuff_document_chain)
+            # Initialize text splitter
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1500,
+                chunk_overlap=200,
+                length_function=len
+            )
+            all_splits = text_splitter.split_documents(data)
 
-def get_response(user_input):
-    #  invokes the chains created to generate a response to a given user query
-    #
-    retriver_chain = get_context_retriever_chain(st.session_state.vector_store)
-    conversation_rag_chain = get_conversation_rag_chain(retriver_chain)
+            # Create and persist the vector store
+            st.session_state.vectorstore = Chroma.from_documents(
+                documents=all_splits,
+                embedding=OllamaEmbeddings(model="mistral")
+            )
+            st.session_state.vectorstore.persist()
 
-    response = conversation_rag_chain.invoke({
-        "chat_history": st.session_state.chat_history,
-        "input": user_input
-    })
+    st.session_state.retriever = st.session_state.vectorstore.as_retriever()
+    # Initialize the QA chain
+    if 'qa_chain' not in st.session_state:
+        st.session_state.qa_chain = RetrievalQA.from_chain_type(
+            llm=st.session_state.llm,
+            chain_type='stuff',
+            retriever=st.session_state.retriever,
+            verbose=True,
+            chain_type_kwargs={
+                "verbose": True,
+                "prompt": st.session_state.prompt,
+                "memory": st.session_state.memory,
+            }
+        )
 
-    return response['answer']
+    # Chat input
+    if user_input := st.chat_input("You:", key="user_input"):
+        user_message = {"role": "user", "message": user_input}
+        st.session_state.chat_history.append(user_message)
+        with st.chat_message("user"):
+            st.markdown(user_input)
+        with st.chat_message("assistant"):
+            with st.spinner("Assistant is typing..."):
+                response = st.session_state.qa_chain(user_input)
+            message_placeholder = st.empty()
+            full_response = ""
+            for chunk in response['result'].split():
+                full_response += chunk + " "
+                time.sleep(0.05)
+                # Add a blinking cursor to simulate typing
+                message_placeholder.markdown(full_response + "▌")
+            message_placeholder.markdown(full_response)
 
+        chatbot_message = {"role": "assistant", "message": response['result']}
+        st.session_state.chat_history.append(chatbot_message)
 
-# streamlit app config
-#
-st.set_page_config(page_title="Lets chat with a Website", page_icon="💻")
-st.title("Lets chat with a Website")
-
-# sidebar setup
-with st.sidebar:
-    st.header("Setting")
-    website_url = st.text_input("Type the URL here")
-
-if website_url is None or website_url == "":
-    st.info("Please enter a website URL...")
 
 else:
-    # Session State
-    #
-    # Check the chat history for follow the conversation
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = [
-            AIMessage(content="Hello, I am a bot. How can I help you?"),
-        ]
-    # Check if there are already info stored in the vectorDB
-    if "vector_store" not in st.session_state:
-        st.session_state.vector_store = get_vectorStrore_from_url(website_url)
-    
-    # user input
-    user_query = st.chat_input("Type here...")
-    if user_query is not None and user_query != "":
-
-        response = get_response(user_query)
-        
-        st.session_state.chat_history.append(HumanMessage(content=user_query))
-        st.session_state.chat_history.append(AIMessage(content=response))
-
-    # conversation history
-    for message in st.session_state.chat_history:
-        if isinstance(message, AIMessage):
-            with st.chat_message("AI"):
-                st.write(message.content)
-        elif isinstance(message, HumanMessage):
-            with st.chat_message("Human"):
-                st.write(message.content)
+    st.write("Please upload a PDF file.")
