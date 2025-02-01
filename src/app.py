@@ -5,124 +5,168 @@ from langchain_community.llms import Ollama
 from langchain_community.embeddings.ollama import OllamaEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import WebBaseLoader
 from langchain.prompts import PromptTemplate
 from langchain.memory import ConversationBufferMemory
-import streamlit as st
-import os
-import time
 
-if not os.path.exists('files'):
-    os.mkdir('files')
-
-if not os.path.exists('jj'):
-    os.mkdir('jj')
-
-if 'template' not in st.session_state:
-    st.session_state.template = """You are a knowledgeable chatbot, here to help with questions of the user. Your tone should be professional and informative.
-
-    Context: {context}
-    History: {history}
-
-    User: {question}
-    Chatbot:"""
-if 'prompt' not in st.session_state:
-    st.session_state.prompt = PromptTemplate(
-        input_variables=["history", "context", "question"],
-        template=st.session_state.template,
-    )
-if 'memory' not in st.session_state:
-    st.session_state.memory = ConversationBufferMemory(
-        memory_key="history",
-        return_messages=True,
-        input_key="question")
-if 'vectorstore' not in st.session_state:
-    st.session_state.vectorstore = Chroma(persist_directory='jj',
-                                          embedding_function=OllamaEmbeddings(base_url='http://localhost:11434',
-                                                                              model="mistral")
-                                          )
-if 'llm' not in st.session_state:
-    st.session_state.llm = Ollama(base_url="http://localhost:11434",
-                                  model="mistral",
-                                  verbose=True,
-                                  callback_manager=CallbackManager(
-                                      [StreamingStdOutCallbackHandler()]),
-                                  )
-
-# Initialize session state
-if 'chat_history' not in st.session_state:
-    st.session_state.chat_history = []
-
-st.title("PDF Chatbot")
-
-# Upload a PDF file
-uploaded_file = st.file_uploader("Upload your PDF", type='pdf')
-
-for message in st.session_state.chat_history:
-    with st.chat_message(message["role"]):
-        st.markdown(message["message"])
-
-if uploaded_file is not None:
-    if not os.path.isfile("files/"+uploaded_file.name+".pdf"):
-        with st.status("Analyzing your document..."):
-            bytes_data = uploaded_file.read()
-            f = open("files/"+uploaded_file.name+".pdf", "wb")
-            f.write(bytes_data)
-            f.close()
-            loader = PyPDFLoader("files/"+uploaded_file.name+".pdf")
-            data = loader.load()
-
-            # Initialize text splitter
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1500,
-                chunk_overlap=200,
-                length_function=len
+class OllamaWrapper:
+    """Wrapper for Ollama integration with LangChain."""
+    
+    def __init__(
+        self,
+        model_name: str = "mistral",
+        base_url: str = "http://localhost:11434",
+        temperature: float = 0.7,
+        verbose: bool = True
+    ):
+        """Initialize Ollama wrapper with specified configuration."""
+        self.model_name = model_name
+        self.base_url = base_url
+        self.temperature = temperature
+        self.verbose = verbose
+        
+        # Initialize the LLM
+        self.llm = Ollama(
+            model=model_name,
+            base_url=base_url,
+            temperature=temperature,
+            verbose=verbose,
+            callback_manager=CallbackManager([StreamingStdOutCallbackHandler()])
+        )
+        
+        # Initialize embeddings
+        self.embeddings = OllamaEmbeddings(
+            model=model_name,
+            base_url=base_url
+        )
+    
+    def create_vector_store(self, documents, persist_directory: str = None) -> Chroma:
+        """Create a vector store from documents."""
+        if persist_directory:
+            return Chroma.from_documents(
+                documents=documents,
+                embedding=self.embeddings,
+                persist_directory=persist_directory
             )
-            all_splits = text_splitter.split_documents(data)
-
-            # Create and persist the vector store
-            st.session_state.vectorstore = Chroma.from_documents(
-                documents=all_splits,
-                embedding=OllamaEmbeddings(model="mistral")
+        return Chroma.from_documents(
+            documents=documents,
+            embedding=self.embeddings
+        )
+    
+    def load_vector_store(self, persist_directory: str) -> Chroma:
+        """Load an existing vector store."""
+        return Chroma(
+            persist_directory=persist_directory,
+            embedding_function=self.embeddings
+        )
+    
+    def create_qa_chain(
+        self,
+        retriever,
+        prompt_template: str = None,
+        memory: ConversationBufferMemory = None,
+        chain_type: str = "stuff"
+    ) -> RetrievalQA:
+        """Create a question-answering chain."""
+        if prompt_template is None:
+            prompt_template = """You are a knowledgeable assistant. Use the following context to answer the question.
+            
+            Context: {context}
+            History: {history}
+            Question: {question}
+            
+            Answer:"""
+            
+        prompt = PromptTemplate(
+            input_variables=["history", "context", "question"],
+            template=prompt_template
+        )
+        
+        if memory is None:
+            memory = ConversationBufferMemory(
+                memory_key="history",
+                input_key="question",
+                return_messages=True
             )
-            st.session_state.vectorstore.persist()
-
-    st.session_state.retriever = st.session_state.vectorstore.as_retriever()
-    # Initialize the QA chain
-    if 'qa_chain' not in st.session_state:
-        st.session_state.qa_chain = RetrievalQA.from_chain_type(
-            llm=st.session_state.llm,
-            chain_type='stuff',
-            retriever=st.session_state.retriever,
-            verbose=True,
+        
+        return RetrievalQA.from_chain_type(
+            llm=self.llm,
+            chain_type=chain_type,
+            retriever=retriever,
+            verbose=self.verbose,
             chain_type_kwargs={
-                "verbose": True,
-                "prompt": st.session_state.prompt,
-                "memory": st.session_state.memory,
+                "verbose": self.verbose,
+                "prompt": prompt,
+                "memory": memory
             }
         )
+    
+    @staticmethod
+    def split_documents(documents, chunk_size: int = 1500, chunk_overlap: int = 200):
+        """Split documents into chunks."""
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            length_function=len
+        )
+        return splitter.split_documents(documents)
+    
+    @staticmethod
+    def load_webpage(url: str) -> list:
+        """Load a webpage."""
+        loader = WebBaseLoader(url)
+        return loader.load()
 
-    # Chat input
-    if user_input := st.chat_input("You:", key="user_input"):
-        user_message = {"role": "user", "message": user_input}
-        st.session_state.chat_history.append(user_message)
-        with st.chat_message("user"):
-            st.markdown(user_input)
-        with st.chat_message("assistant"):
-            with st.spinner("Assistant is typing..."):
-                response = st.session_state.qa_chain(user_input)
-            message_placeholder = st.empty()
-            full_response = ""
-            for chunk in response['result'].split():
-                full_response += chunk + " "
-                time.sleep(0.05)
-                # Add a blinking cursor to simulate typing
-                message_placeholder.markdown(full_response + "▌")
-            message_placeholder.markdown(full_response)
+def get_vector_store(url):
+    documents = OllamaWrapper.load_webpage(url)
+    return OllamaWrapper().create_vector_store(documents)
 
-        chatbot_message = {"role": "assistant", "message": response['result']}
-        st.session_state.chat_history.append(chatbot_message)
+def get_qa_chain(vector_store):
+    retriever = vector_store.as_retriever()
+    return OllamaWrapper().create_qa_chain(retriever)
 
+def get_response(user_input, qa_chain, chat_history):
+    response = qa_chain({"question": user_input, "history": chat_history})
+    return response
+
+# streamlit app config
+#
+import streamlit as st
+st.set_page_config(page_title="Lets chat with a Website", page_icon="💻")
+st.title("Lets chat with a Website")
+
+# sidebar setup
+with st.sidebar:
+    st.header("Setting")
+    website_url = st.text_input("Type the URL here")
+
+if website_url is None or website_url == "":
+    st.info("Please enter a website URL...")
 
 else:
-    st.write("Please upload a PDF file.")
+    # Session State
+    #
+    # Check the chat history for follow the conversation
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    # Check if there are already info stored in the vectorDB
+    if "vector_store" not in st.session_state:
+        st.session_state.vector_store = get_vector_store(website_url)
+    if "qa_chain" not in st.session_state:
+        st.session_state.qa_chain = get_qa_chain(st.session_state.vector_store)
+    
+    # user input
+    user_query = st.chat_input("Type here...")
+    if user_query is not None and user_query != "":
+        response = get_response(user_query, st.session_state.qa_chain, st.session_state.chat_history)
+        st.session_state.chat_history.append(user_query)
+        st.session_state.chat_history.append(response)
+
+    # conversation history
+    for message in st.session_state.chat_history:
+        if isinstance(message, str):
+            with st.chat_message("AI"):
+                st.write(message)
+        elif isinstance(message, dict):
+            with st.chat_message("Human"):
+                st.write(message["question"])
